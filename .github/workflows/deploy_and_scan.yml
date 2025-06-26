@@ -1,0 +1,113 @@
+name: Deploy and Scan with OWASP ZAP
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy App to EC2
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            pkill node || true
+            rm -rf ~/app
+            mkdir ~/app
+          EOF
+
+          scp -r ./* ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/app
+
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            cd ~/app
+            sudo apt update
+            sudo apt install -y nodejs npm
+            npm install
+            nohup node app.js > app.log 2>&1 &
+          EOF
+
+  zap-scan:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Java, jq, and ZAP
+        run: |
+          sudo apt update
+          sudo apt install -y openjdk-11-jre-headless wget unzip jq
+          wget https://github.com/zaproxy/zaproxy/releases/download/w2025-06-23/ZAP_WEEKLY_D-2025-06-23.zip -O zap.zip
+          unzip zap.zip -d zap-dir
+          chmod +x zap-dir/ZAP_*/zap.sh
+
+      - name: Start ZAP Daemon
+        run: |
+          ZAP_PATH=$(find zap-dir -name zap.sh | head -n 1)
+          nohup $ZAP_PATH -daemon -host 127.0.0.1 -port 8090 \
+            -config api.disablekey=true \
+            -config api.addrs.addr.name=.* \
+            -config api.addrs.addr.regex=true \
+            > zap.log 2>&1 &
+
+          echo "⏳ Waiting for ZAP to be ready..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8090/JSON/core/view/version/ > /dev/null; then
+              echo "✅ ZAP is ready."
+              break
+            fi
+            echo "Waiting... ($i)"
+            sleep 5
+          done
+
+      - name: Spider and Active Scan
+        run: |
+          TARGET=http://${{ secrets.EC2_HOST }}:3000
+          echo "🌐 Spidering $TARGET..."
+          spider_id=$(curl -s "http://127.0.0.1:8090/JSON/spider/action/scan/?url=$TARGET" | jq -r '.scan')
+
+          while [[ "$(curl -s "http://127.0.0.1:8090/JSON/spider/view/status/?scanId=$spider_id" | jq -r '.status')" -lt 100 ]]; do
+            echo "⏳ Spider in progress..."
+            sleep 5
+          done
+
+          echo "🚨 Starting Active Scan..."
+          scan_id=$(curl -s "http://127.0.0.1:8090/JSON/ascan/action/scan/?url=$TARGET" | jq -r '.scan')
+
+          while [[ "$(curl -s "http://127.0.0.1:8090/JSON/ascan/view/status/?scanId=$scan_id" | jq -r '.status')" -lt 100 ]]; do
+            echo "⏳ Active scan in progress..."
+            sleep 5
+          done
+
+      - name: Generate ZAP HTML Report
+        run: |
+          curl "http://127.0.0.1:8090/OTHER/core/other/htmlreport/" -o zap-report.html
+
+      - name: Fail on Medium or High Alerts
+        run: |
+          summary=$(curl -s "http://127.0.0.1:8090/JSON/core/view/alertsSummary/")
+          echo "ZAP Alert Summary: $summary"
+          high=$(echo "$summary" | jq -r '.alertSummary.High')
+          medium=$(echo "$summary" | jq -r '.alertSummary.Medium')
+
+          if [[ "$high" -gt 0 || "$medium" -gt 0 ]]; then
+            echo "❌ High or Medium vulnerabilities found. Failing the pipeline."
+            exit 1
+          else
+            echo "✅ No critical vulnerabilities found."
+          fi
+
+      - name: Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.html
+
